@@ -40,8 +40,22 @@ Create a Python-based MQTT subscriber that runs on a Raspberry Pi, connects to a
    - paho-mqtt
    - RPi.GPIO
 
-5. **`README.md`** - Setup and usage instructions
-   - Installation steps
+5. **`broker_setup.sh`** - Broker setup script (optional)
+   - Installs Mosquitto broker via apt
+   - Configures Mosquitto to allow connections from network
+   - Enables and starts Mosquitto service
+   - Optional: opens firewall port 1883
+
+6. **`mosquitto.conf`** - Mosquitto configuration file (optional)
+   - Allows anonymous connections (for simple setup)
+   - Listens on all interfaces (0.0.0.0)
+   - Port 1883 configuration
+   - Can be customized for authentication if needed
+
+7. **`README.md`** - Setup and usage instructions
+   - Broker installation steps
+   - Broker configuration guide
+   - Installation steps for subscriber/publisher
    - Configuration guide
    - Running the subscriber
    - Running the button publisher
@@ -86,6 +100,7 @@ Create a Python-based MQTT subscriber that runs on a Raspberry Pi, connects to a
 
 ### Hardware Requirements
 
+- Raspberry Pi (broker) - runs Mosquitto MQTT broker
 - Raspberry Pi (subscriber) - runs buzzer_subscriber.py
 - Raspberry Pi (optional publisher) - runs button_publisher.py if using physical button
 - 12V DC Active Electronic Buzzer (Electromagnetic Type 12095)
@@ -94,8 +109,48 @@ Create a Python-based MQTT subscriber that runs on a Raspberry Pi, connects to a
 - Push button (if using button_publisher.py) with pull-up resistor
 - Button GPIO pin connection (default: GPIO 23)
 
+### Broker Setup (Mosquitto)
+
+**No Python code needed** - Mosquitto is a C-based service that runs independently.
+
+**Installation Options:**
+
+1. **Using setup script** (`broker_setup.sh`):
+   - Automated installation and configuration
+   - Installs Mosquitto via apt package manager
+   - Configures basic settings for network access
+   - Enables service to start on boot
+
+2. **Manual installation**:
+   ```bash
+   sudo apt update
+   sudo apt install mosquitto mosquitto-clients
+   sudo systemctl enable mosquitto
+   sudo systemctl start mosquitto
+   ```
+
+**Configuration:**
+- Default configuration allows local connections only
+- For network access, configure `/etc/mosquitto/mosquitto.conf`:
+  - Set `listener 1883` and `allow_anonymous true` (for simple setup)
+  - Or use authentication for security
+- Firewall: ensure port 1883 is open if connecting from other devices
+  ```bash
+  sudo ufw allow 1883/tcp
+  ```
+
+**Testing:**
+- Test broker locally: `mosquitto_sub -h localhost -t test`
+- Test from another device: `mosquitto_sub -h <broker-ip> -t test`
+
 ### To-dos
 
+**Broker Setup:**
+- [ ] Create broker_setup.sh script for automated Mosquitto installation and configuration
+- [ ] Create mosquitto.conf example file with basic network configuration
+- [ ] Document broker setup steps in README.md
+
+**Subscriber/Publisher Code:**
 - [ ] Create requirements.txt with paho-mqtt and RPi.GPIO dependencies
 - [ ] Create config.py with MQTT broker settings, GPIO pins, and buzzer duration configuration
 - [ ] Create buzzer_subscriber.py with MQTT subscriber logic and GPIO buzzer control
