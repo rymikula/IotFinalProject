@@ -70,9 +70,12 @@ def main():
     print("Initializing detector...")
     detector = ObjectDetector(
         model_size='nano',  # Use 'nano' for Raspberry Pi
-        confidence_threshold=0.3,  # Lower threshold to catch more detections
+        confidence_threshold=0.3,  # Lower threshold for COCO package classes (backpack, handbag, suitcase)
         event_emitter=event_emitter,
-        debug_mode=True  # Set to False to disable debug output
+        debug_mode=True,  # Set to False to disable debug output
+        min_frames_for_confirmation=8,  # Packages must be detected for 8 frames before confirming
+        package_zone_y_percent=0.6,  # Packages typically appear in lower 60% of frame (ground level)
+        shape_confidence_threshold=0.55  # Minimum confidence for shape-based package detection
     )
     
     # Initialize webcam
@@ -150,6 +153,7 @@ def main():
     time.sleep(0.5)
     
     print("Starting detection... Press 'q' to quit")
+    print(f"Background learning will take {detector.background_learning_frames} frames...")
     
     # FPS calculation
     fps_start_time = time.time()
@@ -185,8 +189,9 @@ def main():
             # Display FPS and detection count
             person_count = sum(1 for d in detections if d['type'] == 'person')
             package_count = sum(1 for d in detections if d['type'] == 'package')
+            confirmed_package_count = len(detector.confirmed_packages)
             
-            info_text = f"FPS: {fps:.1f} | Persons: {person_count} | Packages: {package_count}"
+            info_text = f"FPS: {fps:.1f} | Persons: {person_count} | Packages: {package_count} | Confirmed: {confirmed_package_count}"
             cv2.putText(annotated_frame, info_text,
                        (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
             
