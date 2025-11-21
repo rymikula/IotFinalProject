@@ -43,8 +43,11 @@ class ObjectDetector:
                  shape_confidence_threshold: float = 0.2,  # Lowered from 0.55 for more lenient detection
                  background_learning_frames: int = 100,
                  background_threshold: float = 0.15,
-                 foreground_overlap_threshold: float = 0.8,  # Very lenient - only filter obvious background
-                 static_background_threshold: int = 30):
+                 foreground_overlap_threshold: float = 0.1,  # Very lenient - only filter obvious background
+                 static_background_threshold: int = 30,
+                 max_missing_frames: int = 10,
+                 zone_tolerance_percent: float = 0.1,
+                 person_missing_frames: int = 20):
         """Initialize the object detector.
         
         Args:
@@ -59,6 +62,9 @@ class ObjectDetector:
             background_threshold: Threshold for background subtractor (0.0-1.0)
             foreground_overlap_threshold: Minimum percentage of bbox that must be foreground (0.0-1.0)
             static_background_threshold: Threshold for static background frame differencing (0-255)
+            max_missing_frames: Maximum consecutive frames a package can be missing before unconfirming
+            zone_tolerance_percent: Tolerance buffer around package zone boundary (0.0-1.0)
+            person_missing_frames: Maximum consecutive frames a person can be missing before unconfirming (longer than packages, default: 20)
         """
         self.model_size = model_size
         self.confidence_threshold = confidence_threshold
@@ -71,6 +77,9 @@ class ObjectDetector:
         self.background_threshold = background_threshold
         self.foreground_overlap_threshold = foreground_overlap_threshold
         self.static_background_threshold = static_background_threshold
+        self.max_missing_frames = max_missing_frames
+        self.zone_tolerance_percent = zone_tolerance_percent
+        self.person_missing_frames = person_missing_frames
         
         # Map model size to YOLOv8 model file names
         model_size_map = {
@@ -100,8 +109,23 @@ class ObjectDetector:
         
         # Confirmed packages (detected consistently across multiple frames)
         # Format: {object_id: {'bbox': tuple, 'detection_count': int, 'first_seen': datetime, 
-        #          'last_seen': datetime, 'avg_velocity': float}}
+        #          'last_seen': datetime, 'avg_velocity': float, 'missing_frames': int,
+        #          'zone_violation_frames': int, 'enter_event_emitted': bool}}
         self.confirmed_packages: Dict[int, Dict] = {}
+        
+        # Pending confirmation packages (detected but not yet confirmed)
+        # Format: {object_id: {'bbox': tuple, 'detection_count': int, 'first_seen': datetime}}
+        self.pending_packages: Dict[int, Dict] = {}
+        
+        # Confirmed persons (detected consistently across multiple frames)
+        # Format: {object_id: {'bbox': tuple, 'detection_count': int, 'first_seen': datetime,
+        #          'last_seen': datetime, 'missing_frames': int, 'enter_event_emitted': bool,
+        #          'last_position': tuple, 'velocity_history': list}}
+        self.confirmed_persons: Dict[int, Dict] = {}
+        
+        # Pending confirmation persons (detected but not yet confirmed)
+        # Format: {object_id: {'bbox': tuple, 'detection_count': int, 'first_seen': datetime}}
+        self.pending_persons: Dict[int, Dict] = {}
         
         # Track frame number for temporal analysis
         self.frame_number = 0
@@ -471,42 +495,167 @@ class ObjectDetector:
         # Match current detections with previous ones
         matched_previous = set()
         
+        # Also track which confirmed packages have been matched (to prevent duplicate matches)
+        matched_confirmed = set()
+        
         for det in detections:
             best_match_id = None
-            best_iou = 0.4  # Improved IoU threshold for matching
+            best_iou = 0.3  # Lower IoU threshold for better matching (was 0.4)
             best_velocity = None
+            best_match_score = 0.0
+            match_from_confirmed = False  # Track if match is from confirmed packages
             
             # Calculate center of current detection
             current_center = self._calculate_bbox_center(det['bbox'])
+            current_bbox = det['bbox']
+            current_width = current_bbox[2] - current_bbox[0]
+            current_height = current_bbox[3] - current_bbox[1]
+            current_area = current_width * current_height
             
-            # Try to match with previous detections
-            for prev_id, prev_data in self.previous_detections.items():
-                if prev_id in matched_previous:
-                    continue
-                
-                # Only match same type
-                if prev_data['type'] != det['type']:
-                    continue
-                
-                prev_bbox = prev_data['bbox']
-                prev_center = prev_data.get('center', self._calculate_bbox_center(prev_bbox))
-                
-                iou = self._calculate_iou(det['bbox'], prev_bbox)
-                
-                # Calculate velocity (distance moved per frame)
-                distance = self._calculate_distance(current_center, prev_center)
-                
-                # Prefer matches with high IoU and low velocity (stationary objects)
-                # Packages should be relatively stationary
-                if iou > best_iou:
-                    best_iou = iou
-                    best_match_id = prev_id
-                    best_velocity = distance
+            # FIRST: Try to match with confirmed packages/persons (to prevent false LEAVE events)
+            # This is critical - if a confirmed object reappears, reuse its ID
+            if det['type'] == 'package':
+                for confirmed_id, confirmed_data in self.confirmed_packages.items():
+                    if confirmed_id in matched_confirmed:
+                        continue
+                    
+                    confirmed_bbox = confirmed_data['bbox']
+                    confirmed_center = self._calculate_bbox_center(confirmed_bbox)
+                    
+                    iou = self._calculate_iou(det['bbox'], confirmed_bbox)
+                    distance = self._calculate_distance(current_center, confirmed_center)
+                    
+                    # Size similarity
+                    confirmed_width = confirmed_bbox[2] - confirmed_bbox[0]
+                    confirmed_height = confirmed_bbox[3] - confirmed_bbox[1]
+                    confirmed_area = confirmed_width * confirmed_height
+                    size_ratio = min(current_area, confirmed_area) / max(current_area, confirmed_area) if max(current_area, confirmed_area) > 0 else 0
+                    
+                    # For confirmed packages, be more lenient - they might have moved slightly
+                    # Match if IoU is decent OR if position is close and size is similar
+                    if iou >= 0.2 or (distance < 100 and size_ratio > 0.7):  # More lenient for confirmed
+                        if iou >= 0.2:
+                            match_score = iou
+                        else:
+                            # Position + size based matching
+                            position_score = 1.0 - (distance / 100.0)
+                            match_score = (position_score * 0.5) + (size_ratio * 0.5)
+                        
+                        if match_score > best_match_score:
+                            best_match_score = match_score
+                            best_iou = iou
+                            best_match_id = confirmed_id
+                            best_velocity = distance
+                            match_from_confirmed = True
+            elif det['type'] == 'person':
+                # Match with confirmed persons - use velocity prediction for better matching
+                for confirmed_id, confirmed_data in self.confirmed_persons.items():
+                    if confirmed_id in matched_confirmed:
+                        continue
+                    
+                    confirmed_bbox = confirmed_data['bbox']
+                    confirmed_center = self._calculate_bbox_center(confirmed_bbox)
+                    
+                    # Get last known position and velocity for prediction
+                    last_position = confirmed_data.get('last_position', confirmed_center)
+                    velocity_history = confirmed_data.get('velocity_history', [])
+                    
+                    # Predict where person should be based on velocity
+                    predicted_center = confirmed_center
+                    if velocity_history:
+                        avg_velocity_x = np.mean([v[0] for v in velocity_history[-5:]]) if len(velocity_history) > 0 else 0
+                        avg_velocity_y = np.mean([v[1] for v in velocity_history[-5:]]) if len(velocity_history) > 0 else 0
+                        # Predict position based on average velocity
+                        predicted_center = (confirmed_center[0] + avg_velocity_x, confirmed_center[1] + avg_velocity_y)
+                    
+                    # Calculate distances to both last position and predicted position
+                    distance_to_last = self._calculate_distance(current_center, confirmed_center)
+                    distance_to_predicted = self._calculate_distance(current_center, predicted_center)
+                    distance = min(distance_to_last, distance_to_predicted)  # Use closest match
+                    
+                    iou = self._calculate_iou(det['bbox'], confirmed_bbox)
+                    
+                    # Size similarity
+                    confirmed_width = confirmed_bbox[2] - confirmed_bbox[0]
+                    confirmed_height = confirmed_bbox[3] - confirmed_bbox[1]
+                    confirmed_area = confirmed_width * confirmed_height
+                    size_ratio = min(current_area, confirmed_area) / max(current_area, confirmed_area) if max(current_area, confirmed_area) > 0 else 0
+                    
+                    # For persons, be very lenient - they move more than packages
+                    # Match if IoU is decent OR if position is reasonably close (persons can move a lot)
+                    # Use larger distance threshold (250 pixels) and lower size requirement for persons
+                    max_distance = 250  # Increased from 200 for better matching
+                    if iou >= 0.1 or (distance < max_distance and size_ratio > 0.5):  # Very lenient for persons
+                        if iou >= 0.1:
+                            match_score = iou
+                        else:
+                            # Position + size based matching (more weight on position for persons)
+                            position_score = 1.0 - (distance / max_distance)
+                            match_score = (position_score * 0.6) + (size_ratio * 0.4)  # More weight on position
+                        
+                        if match_score > best_match_score:
+                            best_match_score = match_score
+                            best_iou = iou
+                            best_match_id = confirmed_id
+                            best_velocity = distance
+                            match_from_confirmed = True
             
-            # Assign ID
-            if best_match_id is not None:
+            # SECOND: Try to match with previous detections (if no confirmed match found)
+            if best_match_id is None:
+                for prev_id, prev_data in self.previous_detections.items():
+                    if prev_id in matched_previous:
+                        continue
+                    
+                    # Only match same type
+                    if prev_data['type'] != det['type']:
+                        continue
+                    
+                    prev_bbox = prev_data['bbox']
+                    prev_center = prev_data.get('center', self._calculate_bbox_center(prev_bbox))
+                    
+                    iou = self._calculate_iou(det['bbox'], prev_bbox)
+                    
+                    # Calculate velocity (distance moved per frame)
+                    distance = self._calculate_distance(current_center, prev_center)
+                    
+                    # Position-based matching fallback when IoU is low but position is close
+                    prev_width = prev_bbox[2] - prev_bbox[0]
+                    prev_height = prev_bbox[3] - prev_bbox[1]
+                    prev_area = prev_width * prev_height
+                    
+                    # Size similarity (how similar are the bounding boxes in size)
+                    size_ratio = min(current_area, prev_area) / max(current_area, prev_area) if max(current_area, prev_area) > 0 else 0
+                    
+                    # Calculate match score combining IoU, position, and size
+                    # For packages (stationary), prefer high IoU and low velocity
+                    # But also consider position-based matching if IoU is low but position is close
+                    match_score = iou
+                    
+                    # If IoU is low but position is close and size is similar, use position-based matching
+                    if iou < 0.3 and distance < 50:  # Within 50 pixels
+                        position_score = 1.0 - (distance / 50.0)  # Normalize to 0-1
+                        combined_score = (position_score * 0.4) + (size_ratio * 0.3) + (iou * 0.3)
+                        if combined_score > best_match_score:
+                            best_match_score = combined_score
+                            best_iou = iou
+                            best_match_id = prev_id
+                            best_velocity = distance
+                    elif iou > best_iou:
+                        # Standard IoU-based matching
+                        best_iou = iou
+                        best_match_id = prev_id
+                        best_velocity = distance
+                        best_match_score = iou
+            
+            # Assign ID - use best match if score is good enough
+            # Lower threshold for persons (they move more and need more lenient matching)
+            min_match_threshold = 0.15 if det['type'] == 'person' else 0.2
+            if best_match_id is not None and best_match_score >= min_match_threshold:
                 det_id = best_match_id
-                matched_previous.add(best_match_id)
+                if match_from_confirmed:
+                    matched_confirmed.add(best_match_id)
+                else:
+                    matched_previous.add(best_match_id)
                 
                 # Update tracking data
                 if det_id in self.tracked_objects:
@@ -515,9 +664,24 @@ class ObjectDetector:
                     tracked['detection_count'] = tracked.get('detection_count', 0) + 1
                     tracked['last_seen'] = det.get('timestamp', datetime.now())
                     
-                    # Track velocity
+                    # Track velocity (for persons, track x/y velocity separately)
                     if 'velocities' not in tracked:
                         tracked['velocities'] = []
+                    if 'last_position' not in tracked:
+                        tracked['last_position'] = current_center
+                    
+                    # Calculate velocity vector for persons
+                    if det['type'] == 'person' and tracked['last_position'] is not None:
+                        prev_center = tracked['last_position']
+                        velocity_x = current_center[0] - prev_center[0]
+                        velocity_y = current_center[1] - prev_center[1]
+                        if 'velocity_history' not in tracked:
+                            tracked['velocity_history'] = []
+                        tracked['velocity_history'].append((velocity_x, velocity_y))
+                        # Keep only last 10 velocities
+                        if len(tracked['velocity_history']) > 10:
+                            tracked['velocity_history'] = tracked['velocity_history'][-10:]
+                    
                     if best_velocity is not None:
                         tracked['velocities'].append(best_velocity)
                         # Keep only last 10 velocities
@@ -531,6 +695,9 @@ class ObjectDetector:
                     if len(tracked['positions']) > 20:
                         tracked['positions'] = tracked['positions'][-20:]
                     
+                    # Update last position
+                    tracked['last_position'] = current_center
+                    
                     # Calculate average velocity
                     if tracked['velocities']:
                         tracked['avg_velocity'] = np.mean(tracked['velocities'])
@@ -538,30 +705,40 @@ class ObjectDetector:
                         tracked['avg_velocity'] = 0.0
                 else:
                     # Initialize tracking for matched object
-                    self.tracked_objects[det_id] = {
+                    tracked_obj = {
                         'type': det['type'],
                         'detection_count': 1,
                         'first_seen': det.get('timestamp', datetime.now()),
                         'last_seen': det.get('timestamp', datetime.now()),
                         'velocities': [best_velocity] if best_velocity is not None else [],
                         'positions': [current_center],
+                        'last_position': current_center,
                         'avg_velocity': best_velocity if best_velocity is not None else 0.0
                     }
+                    # Add velocity_history for persons
+                    if det['type'] == 'person':
+                        tracked_obj['velocity_history'] = []
+                    self.tracked_objects[det_id] = tracked_obj
             else:
                 # New object
                 det_id = self.next_object_id
                 self.next_object_id += 1
                 
                 # Initialize tracking for new object
-                self.tracked_objects[det_id] = {
+                new_tracked_obj = {
                     'type': det['type'],
                     'detection_count': 1,
                     'first_seen': det.get('timestamp', datetime.now()),
                     'last_seen': det.get('timestamp', datetime.now()),
                     'velocities': [],
                     'positions': [current_center],
+                    'last_position': current_center,
                     'avg_velocity': 0.0
                 }
+                # Add velocity_history for persons
+                if det['type'] == 'person':
+                    new_tracked_obj['velocity_history'] = []
+                self.tracked_objects[det_id] = new_tracked_obj
             
             # Add tracking info to detection
             det['object_id'] = det_id
@@ -588,6 +765,13 @@ class ObjectDetector:
         current_package_ids = {obj_id for obj_id, det in current_detections.items() 
                               if det['type'] == 'package'}
         
+        # Initialize missing_frames for all confirmed packages
+        for obj_id in self.confirmed_packages.keys():
+            if 'missing_frames' not in self.confirmed_packages[obj_id]:
+                self.confirmed_packages[obj_id]['missing_frames'] = 0
+            if 'zone_violation_frames' not in self.confirmed_packages[obj_id]:
+                self.confirmed_packages[obj_id]['zone_violation_frames'] = 0
+        
         # Update confirmed packages
         for obj_id in current_package_ids:
             det = current_detections[obj_id]
@@ -595,14 +779,18 @@ class ObjectDetector:
             avg_velocity = det.get('avg_velocity', 0.0)
             bbox = det['bbox']
             
-            # Check if package is in the package zone
+            # Check if package is in the package zone with tolerance
             in_package_zone = True
+            zone_boundary = 1.0 - self.package_zone_y_percent
+            zone_tolerance = self.zone_tolerance_percent
+            
             if frame is not None:
                 x1, y1, x2, y2 = bbox
                 frame_height = frame.shape[0]
                 center_y = (y1 + y2) / 2
                 y_position_ratio = center_y / frame_height if frame_height > 0 else 0
-                in_package_zone = y_position_ratio >= (1.0 - self.package_zone_y_percent)
+                # Package is in zone if it's at or above the boundary, with tolerance buffer
+                in_package_zone = y_position_ratio >= (zone_boundary - zone_tolerance)
             
             # Check if package should be confirmed - more lenient requirements
             # Lower the frame requirement and velocity threshold
@@ -612,41 +800,61 @@ class ObjectDetector:
                 # But be more lenient with velocity (packages might move slightly)
                 if avg_velocity <= stationary_velocity_threshold * 2.0 and in_package_zone:  # Double velocity threshold
                     if obj_id not in self.confirmed_packages:
-                        # New confirmed package - emit enter event
-                        self.confirmed_packages[obj_id] = {
-                            'bbox': bbox,
-                            'detection_count': detection_count,
-                            'first_seen': det.get('timestamp', datetime.now()),
-                            'last_seen': det.get('timestamp', datetime.now()),
-                            'avg_velocity': avg_velocity,
-                            'package_score': det.get('package_score', det.get('confidence', 0.0)),
-                            'event_emitted': False
-                        }
-                        if self.debug_mode:
-                            print(f"[DEBUG] Package {obj_id} confirmed after {detection_count} frames "
-                                  f"(velocity: {avg_velocity:.2f}, in_zone: {in_package_zone})")
-                        
-                        # Emit PACKAGE_ENTER event for newly confirmed package
-                        event = DetectionEvent(
-                            event_type=EventType.PACKAGE_ENTER,
-                            object_type='package',
-                            timestamp=self.confirmed_packages[obj_id]['first_seen'],
-                            bounding_box=bbox,
-                            confidence=self.confirmed_packages[obj_id]['package_score']
-                        )
-                        self.event_emitter.emit(event)
-                        self.confirmed_packages[obj_id]['event_emitted'] = True
-                        if self.debug_mode:
-                            print(f"[DEBUG] Emitted PACKAGE_ENTER for newly confirmed package {obj_id}")
-                    else:
-                        # Update existing confirmed package (only if still in zone)
-                        if in_package_zone:
-                            self.confirmed_packages[obj_id]['last_seen'] = det.get('timestamp', datetime.now())
-                            self.confirmed_packages[obj_id]['bbox'] = bbox
-                            self.confirmed_packages[obj_id]['detection_count'] = detection_count
+                        # Check if this was a pending package
+                        if obj_id in self.pending_packages:
+                            # Was pending, now confirming - add to confirmed_packages
+                            self.confirmed_packages[obj_id] = {
+                                'bbox': bbox,
+                                'detection_count': detection_count,
+                                'first_seen': self.pending_packages[obj_id]['first_seen'],
+                                'last_seen': det.get('timestamp', datetime.now()),
+                                'avg_velocity': avg_velocity,
+                                'package_score': det.get('package_score', det.get('confidence', 0.0)),
+                                'missing_frames': 0,
+                                'zone_violation_frames': 0,
+                                'enter_event_emitted': False  # Track if ENTER event was emitted
+                            }
+                            
+                            # Emit PACKAGE_ENTER event ONLY when package is first confirmed
+                            if not self.confirmed_packages[obj_id].get('enter_event_emitted', False):
+                                event = DetectionEvent(
+                                    event_type=EventType.PACKAGE_ENTER,
+                                    object_type='package',
+                                    timestamp=self.confirmed_packages[obj_id]['first_seen'],
+                                    bounding_box=bbox,
+                                    confidence=self.confirmed_packages[obj_id]['package_score']
+                                )
+                                self.event_emitter.emit(event)
+                                self.confirmed_packages[obj_id]['enter_event_emitted'] = True
+                            # Remove from pending
+                            del self.pending_packages[obj_id]
                         else:
-                            # Package moved out of zone - remove it
-                            if self.confirmed_packages[obj_id].get('event_emitted', False):
+                            # New package - add to pending first (hysteresis)
+                            # Will be promoted to confirmed in the pending update section
+                            if obj_id not in self.pending_packages:
+                                self.pending_packages[obj_id] = {
+                                    'bbox': bbox,
+                                    'detection_count': detection_count,
+                                    'first_seen': det.get('timestamp', datetime.now())
+                                }
+                    else:
+                        # Update existing confirmed package
+                        # Reset missing frames since package is detected
+                        self.confirmed_packages[obj_id]['missing_frames'] = 0
+                        self.confirmed_packages[obj_id]['last_seen'] = det.get('timestamp', datetime.now())
+                        self.confirmed_packages[obj_id]['bbox'] = bbox
+                        self.confirmed_packages[obj_id]['detection_count'] = detection_count
+                        
+                        # Check zone with tolerance
+                        if in_package_zone:
+                            # Reset zone violation counter
+                            self.confirmed_packages[obj_id]['zone_violation_frames'] = 0
+                        else:
+                            # Increment zone violation counter
+                            self.confirmed_packages[obj_id]['zone_violation_frames'] += 1
+                            # Only unconfirm if significantly outside zone for multiple frames (increased threshold)
+                            if self.confirmed_packages[obj_id]['zone_violation_frames'] >= 10:  # Increased from 5
+                                # Package moved significantly out of zone - unconfirm it
                                 event = DetectionEvent(
                                     event_type=EventType.PACKAGE_LEAVE,
                                     object_type='package',
@@ -655,29 +863,106 @@ class ObjectDetector:
                                     confidence=0.0
                                 )
                                 self.event_emitter.emit(event)
-                                if self.debug_mode:
-                                    print(f"[DEBUG] Package {obj_id} left package zone - removed")
-                            current_package_ids.discard(obj_id)  # Don't process as current package
-                            if obj_id in self.confirmed_packages:
-                                del self.confirmed_packages[obj_id]
+                                current_package_ids.discard(obj_id)  # Don't process as current package
+                                if obj_id in self.confirmed_packages:
+                                    del self.confirmed_packages[obj_id]
         
-        # Remove packages that are no longer detected (after grace period)
+        # Update pending packages - promote to confirmed if they meet requirements
+        pending_to_remove = []
+        for obj_id, pending_data in self.pending_packages.items():
+            if obj_id in current_package_ids:
+                det = current_detections[obj_id]
+                detection_count = det.get('detection_count', 1)
+                avg_velocity = det.get('avg_velocity', 0.0)
+                bbox = det['bbox']
+                
+                # Check zone with tolerance
+                in_package_zone = True
+                if frame is not None:
+                    x1, y1, x2, y2 = bbox
+                    frame_height = frame.shape[0]
+                    center_y = (y1 + y2) / 2
+                    y_position_ratio = center_y / frame_height if frame_height > 0 else 0
+                    zone_boundary = 1.0 - self.package_zone_y_percent
+                    zone_tolerance = self.zone_tolerance_percent
+                    in_package_zone = y_position_ratio >= (zone_boundary - zone_tolerance)
+                
+                if detection_count >= min_frames and avg_velocity <= stationary_velocity_threshold * 2.0 and in_package_zone:
+                    # Only promote to confirmed if not already confirmed
+                    if obj_id not in self.confirmed_packages:
+                        # Promote to confirmed
+                        self.confirmed_packages[obj_id] = {
+                            'bbox': bbox,
+                            'detection_count': detection_count,
+                            'first_seen': pending_data['first_seen'],
+                            'last_seen': det.get('timestamp', datetime.now()),
+                            'avg_velocity': avg_velocity,
+                            'package_score': det.get('package_score', det.get('confidence', 0.0)),
+                            'missing_frames': 0,
+                            'zone_violation_frames': 0,
+                            'enter_event_emitted': False  # Track if ENTER event was emitted
+                        }
+                        
+                        # Emit PACKAGE_ENTER event ONLY when package is first confirmed
+                        event = DetectionEvent(
+                            event_type=EventType.PACKAGE_ENTER,
+                            object_type='package',
+                            timestamp=self.confirmed_packages[obj_id]['first_seen'],
+                            bounding_box=bbox,
+                            confidence=self.confirmed_packages[obj_id]['package_score']
+                        )
+                        self.event_emitter.emit(event)
+                        self.confirmed_packages[obj_id]['enter_event_emitted'] = True
+                    pending_to_remove.append(obj_id)
+            else:
+                # Pending package not detected - remove if missing too long
+                pending_to_remove.append(obj_id)
+        
+        for obj_id in pending_to_remove:
+            if obj_id in self.pending_packages:
+                del self.pending_packages[obj_id]
+        
+        # Update missing frames for confirmed packages not in current detections
+        # BUT: Only increment if they weren't matched (matched_confirmed tracks this)
         confirmed_ids_to_remove = []
         for obj_id in self.confirmed_packages.keys():
             if obj_id not in current_package_ids:
-                # Package disappeared - emit leave event and remove
-                if self.confirmed_packages[obj_id].get('event_emitted', False):
-                    event = DetectionEvent(
-                        event_type=EventType.PACKAGE_LEAVE,
-                        object_type='package',
-                        timestamp=datetime.now(),
-                        bounding_box=self.confirmed_packages[obj_id]['bbox'],
-                        confidence=0.0
-                    )
-                    self.event_emitter.emit(event)
-                    if self.debug_mode:
-                        print(f"[DEBUG] Emitted PACKAGE_LEAVE for confirmed package {obj_id}")
-                confirmed_ids_to_remove.append(obj_id)
+                # Check if this confirmed package was matched to a current detection
+                # (it would have a different ID now, but we need to check if any detection matched it)
+                was_matched = False
+                for det_id, det in current_detections.items():
+                    if det.get('type') == 'package':
+                        # Check if this detection matches the confirmed package's position/size
+                        det_bbox = det['bbox']
+                        confirmed_bbox = self.confirmed_packages[obj_id]['bbox']
+                        det_center = self._calculate_bbox_center(det_bbox)
+                        confirmed_center = self._calculate_bbox_center(confirmed_bbox)
+                        distance = self._calculate_distance(det_center, confirmed_center)
+                        
+                        # If very close, assume it's the same package (just got new ID)
+                        if distance < 50:  # Within 50 pixels
+                            was_matched = True
+                            break
+                
+                if not was_matched:
+                    # Package not detected this frame - increment missing frames counter
+                    self.confirmed_packages[obj_id]['missing_frames'] += 1
+                    
+                    # Only unconfirm after grace period (max_missing_frames)
+                    if self.confirmed_packages[obj_id]['missing_frames'] >= self.max_missing_frames:
+                        # Package is being unconfirmed - emit PACKAGE_LEAVE event
+                        event = DetectionEvent(
+                            event_type=EventType.PACKAGE_LEAVE,
+                            object_type='package',
+                            timestamp=datetime.now(),
+                            bounding_box=self.confirmed_packages[obj_id]['bbox'],
+                            confidence=0.0
+                        )
+                        self.event_emitter.emit(event)
+                        confirmed_ids_to_remove.append(obj_id)
+                else:
+                    # Package was matched (even with different ID) - reset missing frames
+                    self.confirmed_packages[obj_id]['missing_frames'] = 0
         
         for obj_id in confirmed_ids_to_remove:
             del self.confirmed_packages[obj_id]
@@ -808,51 +1093,220 @@ class ObjectDetector:
         
         return overlap_ratio
     
-    def _detect_enter_leave(self, current_detections: Dict[int, Dict]):
-        """Detect enter/leave events for persons only.
-        Package events are handled in _update_confirmed_packages.
+    def _update_confirmed_persons(self, current_detections: Dict[int, Dict]):
+        """Update confirmed persons with grace period for missing detections.
         
         Args:
             current_detections: Current frame detections with IDs
         """
-        current_ids = set(current_detections.keys())
-        previous_ids = set(self.previous_detections.keys())
+        # Check persons in current detections
+        current_person_ids = {obj_id for obj_id, det in current_detections.items() 
+                             if det['type'] == 'person'}
         
-        # Objects that entered (in current but not in previous)
-        entered_ids = current_ids - previous_ids
-        for obj_id in entered_ids:
+        # Initialize missing_frames and other fields for all confirmed persons
+        for obj_id in self.confirmed_persons.keys():
+            if 'missing_frames' not in self.confirmed_persons[obj_id]:
+                self.confirmed_persons[obj_id]['missing_frames'] = 0
+            if 'velocity_history' not in self.confirmed_persons[obj_id]:
+                self.confirmed_persons[obj_id]['velocity_history'] = []
+            if 'last_position' not in self.confirmed_persons[obj_id]:
+                self.confirmed_persons[obj_id]['last_position'] = self._calculate_bbox_center(self.confirmed_persons[obj_id]['bbox'])
+        
+        # Require minimum frames before confirming (prevent false ENTER events)
+        min_frames = max(2, self.min_frames_for_confirmation // 4)  # Require 2-3 frames for confirmation
+        
+        # Update confirmed persons
+        for obj_id in current_person_ids:
             det = current_detections[obj_id]
+            detection_count = det.get('detection_count', 1)
+            bbox = det['bbox']
+            current_center = self._calculate_bbox_center(bbox)
             
-            # Only handle person events here (package events handled in _update_confirmed_packages)
-            if det['type'] == 'person':
-                event_type = EventType.PERSON_ENTER
-                event = DetectionEvent(
-                    event_type=event_type,
-                    object_type=det['type'],
-                    timestamp=det.get('timestamp'),
-                    bounding_box=det['bbox'],
-                    confidence=det['confidence']
-                )
-                self.event_emitter.emit(event)
+            if detection_count >= min_frames:
+                if obj_id not in self.confirmed_persons:
+                    # Check if this was a pending person
+                    if obj_id in self.pending_persons:
+                        # Was pending, now confirming - add to confirmed_persons
+                        self.confirmed_persons[obj_id] = {
+                            'bbox': bbox,
+                            'detection_count': detection_count,
+                            'first_seen': self.pending_persons[obj_id]['first_seen'],
+                            'last_seen': det.get('timestamp', datetime.now()),
+                            'missing_frames': 0,
+                            'enter_event_emitted': False,
+                            'last_position': current_center,
+                            'velocity_history': []
+                        }
+                        
+                        # Emit PERSON_ENTER event ONLY when person is first confirmed
+                        if not self.confirmed_persons[obj_id].get('enter_event_emitted', False):
+                            event = DetectionEvent(
+                                event_type=EventType.PERSON_ENTER,
+                                object_type='person',
+                                timestamp=self.confirmed_persons[obj_id]['first_seen'],
+                                bounding_box=bbox,
+                                confidence=det.get('confidence', 0.0)
+                            )
+                            self.event_emitter.emit(event)
+                            self.confirmed_persons[obj_id]['enter_event_emitted'] = True
+                        # Remove from pending
+                        del self.pending_persons[obj_id]
+                    else:
+                        # New person - add to pending first (hysteresis)
+                        if obj_id not in self.pending_persons:
+                            self.pending_persons[obj_id] = {
+                                'bbox': bbox,
+                                'detection_count': detection_count,
+                                'first_seen': det.get('timestamp', datetime.now())
+                            }
+                else:
+                    # Update existing confirmed person
+                    # Reset missing frames since person is detected
+                    self.confirmed_persons[obj_id]['missing_frames'] = 0
+                    self.confirmed_persons[obj_id]['last_seen'] = det.get('timestamp', datetime.now())
+                    self.confirmed_persons[obj_id]['bbox'] = bbox
+                    self.confirmed_persons[obj_id]['detection_count'] = detection_count
+                    
+                    # Track velocity for prediction
+                    last_pos = self.confirmed_persons[obj_id].get('last_position', current_center)
+                    velocity_x = current_center[0] - last_pos[0]
+                    velocity_y = current_center[1] - last_pos[1]
+                    
+                    # Update velocity history
+                    if 'velocity_history' not in self.confirmed_persons[obj_id]:
+                        self.confirmed_persons[obj_id]['velocity_history'] = []
+                    self.confirmed_persons[obj_id]['velocity_history'].append((velocity_x, velocity_y))
+                    # Keep only last 10 velocities
+                    if len(self.confirmed_persons[obj_id]['velocity_history']) > 10:
+                        self.confirmed_persons[obj_id]['velocity_history'] = self.confirmed_persons[obj_id]['velocity_history'][-10:]
+                    
+                    # Update last position
+                    self.confirmed_persons[obj_id]['last_position'] = current_center
         
-        # Objects that left (in previous but not in current)
-        left_ids = previous_ids - current_ids
-        for obj_id in left_ids:
-            prev_data = self.previous_detections[obj_id]
-            prev_type = prev_data['type']
-            prev_bbox = prev_data['bbox']
-            
-            # Only handle person events here (package events handled in _update_confirmed_packages)
-            if prev_type == 'person':
-                event_type = EventType.PERSON_LEAVE
-                event = DetectionEvent(
-                    event_type=event_type,
-                    object_type=prev_type,
-                    timestamp=datetime.now(),
-                    bounding_box=prev_bbox,
-                    confidence=0.0
-                )
-                self.event_emitter.emit(event)
+        # Update pending persons - promote to confirmed if they meet requirements
+        pending_to_remove = []
+        for obj_id, pending_data in self.pending_persons.items():
+            if obj_id in current_person_ids:
+                det = current_detections[obj_id]
+                detection_count = det.get('detection_count', 1)
+                bbox = det['bbox']
+                current_center = self._calculate_bbox_center(bbox)
+                
+                if detection_count >= min_frames:
+                    # Only promote if not already confirmed
+                    if obj_id not in self.confirmed_persons:
+                        # Promote to confirmed
+                        self.confirmed_persons[obj_id] = {
+                            'bbox': bbox,
+                            'detection_count': detection_count,
+                            'first_seen': pending_data['first_seen'],
+                            'last_seen': det.get('timestamp', datetime.now()),
+                            'missing_frames': 0,
+                            'enter_event_emitted': False,
+                            'last_position': current_center,
+                            'velocity_history': []
+                        }
+                        
+                        # Emit PERSON_ENTER event ONLY when person is first confirmed
+                        event = DetectionEvent(
+                            event_type=EventType.PERSON_ENTER,
+                            object_type='person',
+                            timestamp=self.confirmed_persons[obj_id]['first_seen'],
+                            bounding_box=bbox,
+                            confidence=det.get('confidence', 0.0)
+                        )
+                        self.event_emitter.emit(event)
+                        self.confirmed_persons[obj_id]['enter_event_emitted'] = True
+                    pending_to_remove.append(obj_id)
+            else:
+                # Pending person not detected - remove if missing too long
+                pending_to_remove.append(obj_id)
+        
+        for obj_id in pending_to_remove:
+            if obj_id in self.pending_persons:
+                del self.pending_persons[obj_id]
+        
+        # Update missing frames for confirmed persons not in current detections
+        # Comprehensive check if they were matched to any current detection (even with different ID)
+        confirmed_ids_to_remove = []
+        for obj_id in self.confirmed_persons.keys():
+            if obj_id not in current_person_ids:
+                # Comprehensive re-identification check
+                was_matched = False
+                confirmed_bbox = self.confirmed_persons[obj_id]['bbox']
+                confirmed_center = self.confirmed_persons[obj_id].get('last_position', 
+                                                                      self._calculate_bbox_center(confirmed_bbox))
+                
+                # Predict where person should be based on velocity
+                velocity_history = self.confirmed_persons[obj_id].get('velocity_history', [])
+                predicted_center = confirmed_center
+                if velocity_history:
+                    avg_velocity_x = np.mean([v[0] for v in velocity_history[-5:]]) if len(velocity_history) > 0 else 0
+                    avg_velocity_y = np.mean([v[1] for v in velocity_history[-5:]]) if len(velocity_history) > 0 else 0
+                    predicted_center = (confirmed_center[0] + avg_velocity_x, confirmed_center[1] + avg_velocity_y)
+                
+                for det_id, det in current_detections.items():
+                    if det.get('type') == 'person':
+                        # Check if this detection matches the confirmed person
+                        det_bbox = det['bbox']
+                        det_center = self._calculate_bbox_center(det_bbox)
+                        
+                        # Check distances to both last position and predicted position
+                        distance_to_last = self._calculate_distance(det_center, confirmed_center)
+                        distance_to_predicted = self._calculate_distance(det_center, predicted_center)
+                        distance = min(distance_to_last, distance_to_predicted)
+                        
+                        # Also check IoU and size similarity
+                        iou = self._calculate_iou(det_bbox, confirmed_bbox)
+                        det_width = det_bbox[2] - det_bbox[0]
+                        det_height = det_bbox[3] - det_bbox[1]
+                        det_area = det_width * det_height
+                        confirmed_width = confirmed_bbox[2] - confirmed_bbox[0]
+                        confirmed_height = confirmed_bbox[3] - confirmed_bbox[1]
+                        confirmed_area = confirmed_width * confirmed_height
+                        size_ratio = min(det_area, confirmed_area) / max(det_area, confirmed_area) if max(det_area, confirmed_area) > 0 else 0
+                        
+                        # Very lenient matching - use larger search radius (250 pixels) for persons
+                        max_distance = 250
+                        if iou >= 0.1 or (distance < max_distance and size_ratio > 0.5):  # Very lenient for persons
+                            was_matched = True
+                            break
+                
+                if not was_matched:
+                    # Person not detected this frame - increment missing frames counter
+                    self.confirmed_persons[obj_id]['missing_frames'] += 1
+                    
+                    # Only unconfirm after grace period (longer for persons since they move more)
+                    if self.confirmed_persons[obj_id]['missing_frames'] >= self.person_missing_frames:
+                        # Person is being unconfirmed - emit PERSON_LEAVE event
+                        event = DetectionEvent(
+                            event_type=EventType.PERSON_LEAVE,
+                            object_type='person',
+                            timestamp=datetime.now(),
+                            bounding_box=self.confirmed_persons[obj_id]['bbox'],
+                            confidence=0.0
+                        )
+                        self.event_emitter.emit(event)
+                        confirmed_ids_to_remove.append(obj_id)
+                else:
+                    # Person was matched (even with different ID) - reset missing frames
+                    self.confirmed_persons[obj_id]['missing_frames'] = 0
+        
+        for obj_id in confirmed_ids_to_remove:
+            del self.confirmed_persons[obj_id]
+    
+    def _detect_enter_leave(self, current_detections: Dict[int, Dict]):
+        """Detect enter/leave events for persons only.
+        Package events are handled in _update_confirmed_packages.
+        Person events are now handled in _update_confirmed_persons.
+        This method is kept for backward compatibility but does nothing.
+        
+        Args:
+            current_detections: Current frame detections with IDs
+        """
+        # Person enter/leave events are now handled in _update_confirmed_persons
+        # with grace periods and better tracking
+        pass
     
     def process_frame(self, frame: np.ndarray) -> Tuple[np.ndarray, List[Dict]]:
         """Process a single frame and detect objects.
@@ -983,8 +1437,8 @@ class ObjectDetector:
         # Update confirmed packages (temporal filtering) - pass frame for zone checking
         self._update_confirmed_packages(current_detections, frame)
         
-        # Detect enter/leave events (only for confirmed packages)
-        self._detect_enter_leave(current_detections)
+        # Update confirmed persons (with grace periods and better tracking)
+        self._update_confirmed_persons(current_detections)
         
         # Draw confirmed packages with special visualization
         for obj_id, confirmed_pkg in self.confirmed_packages.items():
